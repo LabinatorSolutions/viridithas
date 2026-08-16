@@ -1078,6 +1078,10 @@ pub fn run_relabel(input: &Path, output: &Path) -> anyhow::Result<()> {
     // open the input file
     let input_file = File::open(input)
         .with_context(|| format!("Failed to create input file: {}", input.display()))?;
+    let file_size = input_file
+        .metadata()
+        .with_context(|| format!("Failed to get metadata for {}", input.display()))?
+        .len();
     let input_buffer = BufReader::new(input_file);
 
     // open the output file
@@ -1086,18 +1090,23 @@ pub fn run_relabel(input: &Path, output: &Path) -> anyhow::Result<()> {
     let output_buffer = BufWriter::new(output_file);
 
     println!("Relabelling evaluations...");
-    relabel_binpacks(input_buffer, output_buffer)?;
+    relabel_binpacks(input_buffer, output_buffer, file_size)?;
 
     Ok(())
 }
 
-#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 fn relabel_binpacks(
-    mut input_buffer: impl BufRead,
+    mut input_buffer: impl BufRead + Seek,
     mut output_buffer: impl Write,
+    file_size: u64,
 ) -> Result<(), anyhow::Error> {
     let nnue_params = NNUEParams::decompress_and_alloc()?;
     let mut nnue_state = NNUEState::new(&Board::startpos(), nnue_params);
+
+    let start = Instant::now();
+    let mut games = 0u64;
+    let mut positions = 0u64;
 
     let mut move_buffer = Vec::new();
     while let Ok(mut game) =
@@ -1105,23 +1114,23 @@ fn relabel_binpacks(
     {
         let mut rollout = game.initial_position();
         for (mv, slot) in game.buffer_mut() {
-            // why reïnitialise every time?
-            // we cannot use efficient incremental updates,
-            // as games can run for >1000 ply, which is much
-            // beyond the 128 ply limit that we have at time of writing.
-            // this *is* needlessly slow. converting a whole master-quality
-            // dataset will take small double-digit hours because of this.
-            nnue_state.reïnit_from(&rollout, nnue_params);
-            let value = i32::from(slot.get());
             // we preserve decisive evaluations.
             // the ×2 is because we have changed the mate value
             // a couple times over course of development, and
             // so we behave conservatively. Filtering uses the
             // same heuristic, so we just toss data that is too
             // extreme.
+            let value = i32::from(slot.get());
             let new_value = if is_decisive(value * 2) {
                 value
             } else {
+                // why reïnitialise every time?
+                // we cannot use efficient incremental updates,
+                // as games can run for >1000 ply, which is much
+                // beyond the 128 ply limit that we have at time of writing.
+                // this *is* needlessly slow. converting a whole master-quality
+                // dataset will take small double-digit hours because of this.
+                nnue_state.reïnit_from(&rollout, nnue_params);
                 let pov_eval = nnue_state.evaluate(nnue_params, &rollout);
                 // viriformat uses white-relative evaluations throughout.
                 if rollout.turn() == Colour::Black {
@@ -1142,12 +1151,47 @@ fn relabel_binpacks(
             slot.set(new_value);
 
             rollout.make_move_simple(*mv);
+            positions += 1;
         }
 
         game.serialise_into(&mut output_buffer)
             .context("Failed to serialise game into output buffer.")?;
 
         move_buffer = game.into_move_buffer();
+
+        // print progress
+        games += 1;
+        if games.is_multiple_of(1024) {
+            let progress = input_buffer
+                .stream_position()
+                .with_context(|| "Failed to get stream position.")?;
+            let fraction = progress as f64 / file_size as f64;
+            let elapsed = start.elapsed().as_secs_f64();
+            print!(
+                "\rProgress: {percentage:.1}% | {positions} positions | {pps:.0} positions/sec | ETA {eta:.1}h",
+                percentage = fraction * 100.0,
+                pps = positions as f64 / elapsed,
+                eta = elapsed * (1.0 - fraction) / fraction / 3600.0,
+            );
+            std::io::stdout()
+                .flush()
+                .with_context(|| "Failed to flush stdout!")?;
+        }
+    }
+
+    let final_pos = input_buffer
+        .stream_position()
+        .with_context(|| "Failed to get stream position.")?;
+    println!(
+        "\rProgress: {percentage:.1}% | {positions} positions in {hours:.1}h                    ",
+        percentage = final_pos as f64 / file_size as f64 * 100.0,
+        hours = start.elapsed().as_secs_f64() / 3600.0,
+    );
+    if final_pos < file_size {
+        eprintln!(
+            "[!] stopped {}b short of the end of the input.",
+            file_size - final_pos
+        );
     }
 
     output_buffer
