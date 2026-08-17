@@ -180,7 +180,11 @@ fn main() -> anyhow::Result<()> {
             output,
         }) => datagen::run_rescale(&input, &output, scale),
         #[cfg(feature = "datagen")]
-        Some(Relabel { input, output }) => datagen::run_relabel(&input, &output),
+        Some(Relabel {
+            input,
+            output,
+            threads,
+        }) => datagen::run_relabel(&input, &output, threads),
         #[cfg(feature = "datagen")]
         Some(Splat {
             input,

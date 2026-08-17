@@ -195,11 +195,15 @@ impl Game {
         Ok(())
     }
 
-    /// Deserialises a game from a byte stream.
+    /// Deserialises a game from a byte stream, yielding `Ok(None)` if the
+    /// stream has ended. A truncated or malformed game is an `Err`.
     pub fn deserialise_from(
         reader: &mut impl std::io::BufRead,
         buffer: Vec<(Move, marlinformat::util::I16Le)>,
-    ) -> std::io::Result<Self> {
+    ) -> std::io::Result<Option<Self>> {
+        if reader.fill_buf()?.is_empty() {
+            return Ok(None);
+        }
         let mut initial_position = [0; std::mem::size_of::<marlinformat::PackedBoard>()];
         reader.read_exact(&mut initial_position)?;
         let initial_position = PackedBoard::from_bytes(initial_position);
@@ -241,10 +245,10 @@ impl Game {
             #[cfg(debug_assertions)]
             real_board.make_move_simple(mv);
         }
-        Ok(Self {
+        Ok(Some(Self {
             initial_position,
             moves,
-        })
+        }))
     }
 
     /// Exposes a reference to each position and associated evaluation in the game sequentially, via a callback.
@@ -448,7 +452,9 @@ mod tests {
 
         let mut buf = Vec::new();
         game.serialise_into(&mut buf).unwrap();
-        let game2 = Game::deserialise_from(&mut buf.as_slice(), Vec::new()).unwrap();
+        let game2 = Game::deserialise_from(&mut buf.as_slice(), Vec::new())
+            .unwrap()
+            .unwrap();
         assert_eq!(game.initial_position, game2.initial_position);
         assert_eq!(game.moves, game2.moves);
     }

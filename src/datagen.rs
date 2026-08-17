@@ -16,10 +16,11 @@ use std::{
     ops::ControlFlow,
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc::{self, Receiver},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, anyhow, bail};
@@ -846,8 +847,9 @@ pub fn run_splat(
     print!("0 games splatted");
     let mut game_count = 0;
     let mut move_buffer = Vec::new();
-    while let Ok(game) =
+    while let Some(game) =
         dataformat::Game::deserialise_from(&mut input_buffer, std::mem::take(&mut move_buffer))
+            .with_context(|| format!("Failed to deserialise game {game_count} of the input."))?
     {
         if marlinformat {
             game.splat_to_marlinformat(
@@ -941,8 +943,9 @@ pub fn run_topgn(
     println!("Converting to PGN...");
     let mut move_buffer = Vec::new();
     let mut game_count = 0;
-    while let Ok(game) =
+    while let Some(game) =
         dataformat::Game::deserialise_from(&mut input_buffer, std::mem::take(&mut move_buffer))
+            .with_context(|| format!("Failed to deserialise game {game_count} of the input."))?
     {
         let outcome = game.outcome();
         let mut board = game.initial_position();
@@ -1032,9 +1035,12 @@ fn rescale_binpacks(
 ) -> Result<(), anyhow::Error> {
     let mut move_buffer = Vec::new();
     let mut clamps = 0u64;
-    while let Ok(mut game) =
+    let mut games = 0u64;
+    while let Some(mut game) =
         dataformat::Game::deserialise_from(&mut input_buffer, std::mem::take(&mut move_buffer))
+            .with_context(|| format!("Failed to deserialise game {games} of the input."))?
     {
+        games += 1;
         for (_, slot) in game.buffer_mut() {
             let value = i32::from(slot.get());
             let new_value = if is_decisive(value * 2) {
@@ -1072,7 +1078,7 @@ fn rescale_binpacks(
 }
 
 /// Take a binpack, and write a new binpack with identical data but relabelling evaluations using the static NNUE evaluation.
-pub fn run_relabel(input: &Path, output: &Path) -> anyhow::Result<()> {
+pub fn run_relabel(input: &Path, output: &Path, threads: Option<usize>) -> anyhow::Result<()> {
     // check that the input file exists
     if !input.try_exists()? {
         bail!("Input file does not exist.");
@@ -1082,6 +1088,11 @@ pub fn run_relabel(input: &Path, output: &Path) -> anyhow::Result<()> {
         bail!("Output file already exists.");
     }
 
+    let threads = threads.unwrap_or_else(num_cpus::get);
+    if threads == 0 {
+        bail!("Cannot relabel on zero threads.");
+    }
+
     // open the input file
     let input_file = File::open(input)
         .with_context(|| format!("Failed to create input file: {}", input.display()))?;
@@ -1089,37 +1100,169 @@ pub fn run_relabel(input: &Path, output: &Path) -> anyhow::Result<()> {
         .metadata()
         .with_context(|| format!("Failed to get metadata for {}", input.display()))?
         .len();
-    let input_buffer = BufReader::new(input_file);
+    let input_buffer = BufReader::with_capacity(MEGABYTE, input_file);
 
     // open the output file
     let output_file = File::create(output)
         .with_context(|| format!("Failed to create output file: {}", output.display()))?;
-    let output_buffer = BufWriter::new(output_file);
+    let output_buffer = BufWriter::with_capacity(MEGABYTE, output_file);
 
-    println!("Relabelling evaluations...");
-    relabel_binpacks(input_buffer, output_buffer, file_size)?;
+    println!("Relabelling evaluations on {threads} threads...");
+    relabel_binpacks(
+        input_buffer,
+        output_buffer,
+        file_size,
+        threads,
+        RELABEL_BATCH_GAMES,
+    )?;
 
     Ok(())
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+const RELABEL_BATCH_GAMES: usize = 512;
+
+/// A batch of games to be relabelled.
+struct RelabelBatch {
+    games: Vec<Game>,
+    /// Index of the batch in the sequence.
+    index: u64,
+    /// Number of bytes the batch forms on disc.
+    len: u64,
+    /// The position in the input just past the end of the batch.
+    end_offset: u64,
+}
+
+/// A batch of games that has been relabelled and serialised back into bytes.
+struct RelabelledBatch {
+    data: Vec<u8>,
+    /// Index of the batch in the sequence.
+    index: u64,
+    /// The position in the input just past the end of the batch.
+    end_offset: u64,
+}
+
 fn relabel_binpacks(
     mut input_buffer: impl BufRead + Seek,
-    mut output_buffer: impl Write,
+    output_buffer: impl Write + Send,
     file_size: u64,
+    threads: usize,
+    batch_games: usize,
 ) -> Result<(), anyhow::Error> {
+    #![allow(clippy::cast_precision_loss)]
     let nnue_params = NNUEParams::decompress_and_alloc()?;
-    let mut nnue_state = NNUEState::new(&Board::startpos(), nnue_params);
-
     let start = Instant::now();
-    let mut games = 0u64;
-    let mut positions = 0u64;
-    let mut clamped = 0u64;
 
-    let mut move_buffer = Vec::new();
-    while let Ok(mut game) =
-        dataformat::Game::deserialise_from(&mut input_buffer, std::mem::take(&mut move_buffer))
-    {
+    // running totals
+    let positions = AtomicU64::new(0);
+
+    let (work_tx, work_rx) = mpsc::sync_channel::<RelabelBatch>(threads);
+    let work_rx = Arc::new(Mutex::new(work_rx));
+    let (done_tx, done_rx) = mpsc::sync_channel::<anyhow::Result<RelabelledBatch>>(threads);
+
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        // relabelling threads:
+        for _ in 0..threads {
+            let work_rx = Arc::clone(&work_rx);
+            let done_tx = done_tx.clone();
+            let positions = &positions;
+            scope.spawn(move || {
+                let mut nnue_state = NNUEState::new(&Board::startpos(), nnue_params);
+                // lockguard can’t be in the loop scrutinee, so, closure.
+                let next_batch = || work_rx.lock().unwrap().recv().ok();
+                while let Some(batch) = next_batch() {
+                    let relabelled = relabel_batch(batch, &mut nnue_state, nnue_params, positions);
+                    if done_tx.send(relabelled).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        drop(done_tx);
+        drop(work_rx);
+
+        // writer thread:
+        let counter = &positions;
+        let writer = scope
+            .spawn(move || write_relabelled(output_buffer, &done_rx, file_size, start, counter));
+
+        // then we become the reader thread:
+        let mut index = 0;
+        let mut offset = input_buffer
+            .stream_position()
+            .with_context(|| "Failed to get stream position.")?;
+        let mut exhausted = false;
+        loop {
+            let mut games = Vec::with_capacity(batch_games);
+            while games.len() < batch_games {
+                let next = Game::deserialise_from(&mut input_buffer, Vec::new())
+                    .with_context(|| {
+                        format!(
+                            "Failed to deserialise game {n} of the batch beginning at byte {offset} of the input.",
+                            n = games.len()
+                        )
+                    })?;
+                let Some(game) = next else {
+                    exhausted = true;
+                    break;
+                };
+                games.push(game);
+            }
+            if !games.is_empty() {
+                let end_offset = input_buffer
+                    .stream_position()
+                    .with_context(|| "Failed to get stream position.")?;
+                let batch = RelabelBatch {
+                    index,
+                    games,
+                    len: end_offset - offset,
+                    end_offset,
+                };
+                if work_tx.send(batch).is_err() {
+                    break;
+                }
+                index += 1;
+                offset = end_offset;
+            }
+            if exhausted {
+                break;
+            }
+        }
+
+        drop(work_tx);
+
+        writer
+            .join()
+            .map_err(|_| anyhow!("The relabelling writer thread panicked."))?
+    })?;
+
+    println!(
+        "\rProgress: 100.0% | {positions} positions in {hours:.1}h                    ",
+        positions = positions.load(Ordering::Relaxed),
+        hours = start.elapsed().as_secs_f64() / 3600.0,
+    );
+
+    Ok(())
+}
+
+fn relabel_batch(
+    batch: RelabelBatch,
+    nnue_state: &mut NNUEState,
+    nnue_params: &NNUEParams,
+    positions_total: &AtomicU64,
+) -> anyhow::Result<RelabelledBatch> {
+    let RelabelBatch {
+        index,
+        mut games,
+        len,
+        end_offset,
+    } = batch;
+    // the output is exactly as long as the input!
+    let mut data = Vec::with_capacity(usize::try_from(len).unwrap());
+
+    let mut positions = 0u64;
+
+    for game in &mut games {
         let mut rollout = game.initial_position();
         for (mv, slot) in game.buffer_mut() {
             // we preserve decisive evaluations.
@@ -1136,17 +1279,12 @@ fn relabel_binpacks(
                 // we cannot use efficient incremental updates,
                 // as games can run for >1000 ply, which is much
                 // beyond the 128 ply limit that we have at time of writing.
-                // this *is* needlessly slow. converting a whole master-quality
-                // dataset will take small double-digit hours because of this.
                 nnue_state.reïnit_from(&rollout, nnue_params);
                 // the raw output can be far outside the heuristic range (and
                 // even outside i16) in positions with insane material
                 // imbalances, so we clamp it.
                 let raw_eval = nnue_state.evaluate(nnue_params, &rollout);
                 let pov_eval = clamp_net_output(raw_eval);
-                if pov_eval != raw_eval {
-                    clamped += 1;
-                }
                 // viriformat uses white-relative evaluations throughout.
                 if rollout.turn() == Colour::Black {
                     -pov_eval
@@ -1165,47 +1303,59 @@ fn relabel_binpacks(
             positions += 1;
         }
 
-        game.serialise_into(&mut output_buffer)
+        game.serialise_into(&mut data)
             .context("Failed to serialise game into output buffer.")?;
+    }
 
-        move_buffer = game.into_move_buffer();
+    positions_total.fetch_add(positions, Ordering::Relaxed);
 
-        // print progress
-        games += 1;
-        if games.is_multiple_of(1024) {
-            let progress = input_buffer
-                .stream_position()
-                .with_context(|| "Failed to get stream position.")?;
-            let fraction = progress as f64 / file_size as f64;
-            let elapsed = start.elapsed().as_secs_f64();
-            print!(
-                "\rProgress: {percentage:.1}% | {positions} positions | {pps:.0} positions/sec | ETA {eta:.1}h",
-                percentage = fraction * 100.0,
-                pps = positions as f64 / elapsed,
-                eta = elapsed * (1.0 - fraction) / fraction / 3600.0,
-            );
-            std::io::stdout()
-                .flush()
-                .with_context(|| "Failed to flush stdout!")?;
+    Ok(RelabelledBatch {
+        data,
+        index,
+        end_offset,
+    })
+}
+
+fn write_relabelled(
+    mut output_buffer: impl Write,
+    results: &Receiver<anyhow::Result<RelabelledBatch>>,
+    file_size: u64,
+    start: Instant,
+    positions: &AtomicU64,
+) -> anyhow::Result<()> {
+    #![allow(clippy::cast_precision_loss)]
+    const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+
+    // batches finish ooo
+    let mut pending = HashMap::new();
+    let mut next_index = 0u64;
+    let mut last_print = start;
+
+    while let Ok(batch) = results.recv() {
+        let batch = batch?;
+        pending.insert(batch.index, batch);
+        while let Some(batch) = pending.remove(&next_index) {
+            output_buffer
+                .write_all(&batch.data)
+                .context("Failed to write relabelled games into output buffer.")?;
+            next_index += 1;
+
+            if last_print.elapsed() >= PROGRESS_INTERVAL {
+                last_print = Instant::now();
+                let positions = positions.load(Ordering::Relaxed);
+                let fraction = batch.end_offset as f64 / file_size as f64;
+                let elapsed = start.elapsed().as_secs_f64();
+                print!(
+                    "\rProgress: {percentage:.1}% | {positions} positions | {pps:.0} positions/sec | ETA {eta:.1}h",
+                    percentage = fraction * 100.0,
+                    pps = positions as f64 / elapsed,
+                    eta = elapsed * (1.0 - fraction) / fraction / 3600.0,
+                );
+                std::io::stdout()
+                    .flush()
+                    .with_context(|| "Failed to flush stdout!")?;
+            }
         }
-    }
-
-    let final_pos = input_buffer
-        .stream_position()
-        .with_context(|| "Failed to get stream position.")?;
-    println!(
-        "\rProgress: {percentage:.1}% | {positions} positions in {hours:.1}h                    ",
-        percentage = final_pos as f64 / file_size as f64 * 100.0,
-        hours = start.elapsed().as_secs_f64() / 3600.0,
-    );
-    if final_pos < file_size {
-        eprintln!(
-            "[!] stopped {}b short of the end of the input.",
-            file_size - final_pos
-        );
-    }
-    if clamped > 0 {
-        println!("[!] clamped {clamped} network evaluations into the heuristic range.");
     }
 
     output_buffer
@@ -1330,8 +1480,14 @@ pub fn dataset_stats(dataset_path: &Path) -> anyhow::Result<()> {
     let mut reader =
         BufReader::new(File::open(dataset_path).with_context(|| "Failed to open dataset.")?);
 
-    while let Ok(game) =
+    while let Some(game) =
         dataformat::Game::deserialise_from(&mut reader, std::mem::take(&mut move_buffer))
+            .with_context(|| {
+                format!(
+                    "Failed to deserialise game {games} of the dataset.",
+                    games = stats.games
+                )
+            })?
     {
         stats.games += 1;
         *stats.length_counts.entry(game.len()).or_default() += 1;
@@ -1521,23 +1677,14 @@ pub fn dataset_count(path: &Path) -> anyhow::Result<()> {
                 let mut filtered = 0u64;
                 let mut pass_count_buckets = vec![0u64; Game::MAX_SPLATTABLE_GAME_SIZE];
                 let mut move_buffer = Vec::new();
-                loop {
-                    match dataformat::Game::deserialise_from(&mut reader, std::mem::take(&mut move_buffer)) {
-                        Ok(game) => {
-                            count += game.len() as u64;
-                            let pass_count = game.filter_pass_count(filter);
-                            filtered += pass_count;
-                            pass_count_buckets[usize::try_from(pass_count).unwrap().min(Game::MAX_SPLATTABLE_GAME_SIZE - 1)] += 1;
-                            move_buffer = game.into_move_buffer();
-                        }
-                        Err(error) => {
-                            match error.kind() {
-                                std::io::ErrorKind::UnexpectedEof => {}
-                                _ => eprintln!("[WARN] dataset_count encountered an unexpected error wile reading {file}: {error}\n[WARN] this occured at an offset of {:?} into the file (but probably earlier than this, as we use buffered IO)\n[WARN] for reference, {file} is {} bytes long.", reader.into_inner().stream_position(), len, file = path.file_name().map_or(Cow::Borrowed("<???>"), |oss| oss.to_string_lossy()))
-                            }
-                            break;
-                        }
-                    }
+                while let Some(game) = dataformat::Game::deserialise_from(&mut reader, std::mem::take(&mut move_buffer))
+                    .with_context(|| format!("Failed to deserialise a game from {file} after {count} positions ({file} is {len} bytes long).", file = path.file_name().map_or(Cow::Borrowed("<???>"), |oss| oss.to_string_lossy())))?
+                {
+                    count += game.len() as u64;
+                    let pass_count = game.filter_pass_count(filter);
+                    filtered += pass_count;
+                    pass_count_buckets[usize::try_from(pass_count).unwrap().min(Game::MAX_SPLATTABLE_GAME_SIZE - 1)] += 1;
+                    move_buffer = game.into_move_buffer();
                 }
                 let lock = stdout_lock.lock().map_err(|_| anyhow!("Failed to lock mutex."))?;
                 println!("{:mpl$}: {} | {}", path.display(), count, filtered);
@@ -1580,7 +1727,74 @@ pub fn dataset_count(path: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{datagen::dataformat, evaluation::is_decisive};
+    use crate::{
+        datagen::dataformat,
+        evaluation::{clamp_net_output, is_decisive},
+    };
+
+    #[test]
+    fn parallel_relabel_correct() {
+        let input_binpacks = include_bytes!("../embeds/test-vf.bin");
+        let file_size = input_binpacks.len() as u64;
+
+        let relabel_with = |threads| {
+            let mut input_cursor = std::io::Cursor::new(input_binpacks);
+            let mut output = Vec::new();
+            super::relabel_binpacks(&mut input_cursor, &mut output, file_size, threads, 1).unwrap();
+            output
+        };
+
+        let serial = relabel_with(1);
+        assert!(!serial.is_empty());
+        for threads in [2, 3, 8] {
+            assert_eq!(
+                serial,
+                relabel_with(threads),
+                "relabelling with {threads} threads did not match the serial output"
+            );
+        }
+
+        let mut cursor = std::io::Cursor::new(serial);
+        let mut move_buffer = Vec::new();
+        while let Some(game) =
+            dataformat::Game::deserialise_from(&mut cursor, std::mem::take(&mut move_buffer))
+                .unwrap()
+        {
+            for (_, slot) in game.buffer() {
+                let eval = i32::from(slot.get());
+                assert!(
+                    is_decisive(eval * 2) || eval == clamp_net_output(eval),
+                    "relabelled evaluation {eval} is outside the heuristic range"
+                );
+            }
+            move_buffer = game.into_move_buffer();
+        }
+    }
+
+    #[test]
+    fn truncated_rejected() {
+        let full = include_bytes!("../embeds/test-vf.bin");
+
+        // lop off the last game's terminator
+        let truncated = &full[..full.len() - 4];
+
+        for threads in [1, 4] {
+            let mut input_cursor = std::io::Cursor::new(truncated);
+            let mut output = Vec::new();
+            let err = super::relabel_binpacks(
+                &mut input_cursor,
+                &mut output,
+                truncated.len() as u64,
+                threads,
+                1,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("Failed to deserialise game"),
+                "unexpected error on {threads} threads: {err:#}"
+            );
+        }
+    }
 
     #[test]
     fn test_scaling() {
@@ -1594,14 +1808,17 @@ mod tests {
         output_cursor.set_position(0);
         let mut input_move_buffer = Vec::new();
         let mut output_move_buffer = Vec::new();
-        while let Ok(input_game) = dataformat::Game::deserialise_from(
+        while let Some(input_game) = dataformat::Game::deserialise_from(
             &mut input_cursor,
             std::mem::take(&mut input_move_buffer),
-        ) {
+        )
+        .unwrap()
+        {
             let output_game = dataformat::Game::deserialise_from(
                 &mut output_cursor,
                 std::mem::take(&mut output_move_buffer),
             )
+            .unwrap()
             .unwrap();
             let input_slots = input_game.buffer();
             let output_slots = output_game.buffer();

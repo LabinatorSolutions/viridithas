@@ -100,6 +100,9 @@ pub enum Subcommands {
         input: PathBuf,
         /// Path to output packed game record.
         output: PathBuf,
+        /// Number of threads to relabel on.
+        #[clap(long, value_name = "N")]
+        threads: Option<usize>,
     },
     /// Splat a packed game record into bulletformat records (or other format)
     #[cfg(feature = "datagen")]
