@@ -36,7 +36,7 @@ use crate::{
         types::Square,
     },
     datagen::dataformat::Game,
-    evaluation::{is_decisive, is_mate_score},
+    evaluation::{clamp_net_output, is_decisive, is_mate_score},
     nnue::network::{NNUEParams, NNUEState},
     search::{parameters::Config, search_position, static_exchange_eval},
     searchinfo::Control,
@@ -1031,6 +1031,7 @@ fn rescale_binpacks(
     mut output_buffer: impl Write,
 ) -> Result<(), anyhow::Error> {
     let mut move_buffer = Vec::new();
+    let mut clamps = 0u64;
     while let Ok(mut game) =
         dataformat::Game::deserialise_from(&mut input_buffer, std::mem::take(&mut move_buffer))
     {
@@ -1039,11 +1040,13 @@ fn rescale_binpacks(
             let new_value = if is_decisive(value * 2) {
                 value
             } else {
-                (f64::from(value) * scale).round() as i32
+                let scaled = (f64::from(value) * scale).round() as i32;
+                let clamped = clamp_net_output(scaled);
+                if clamped != scaled {
+                    clamps += 1;
+                }
+                clamped
             };
-            if is_decisive(new_value) && !is_decisive(value) {
-                eprintln!("[!] a network evaluation became decisive ({value} -> {new_value})");
-            }
             let new_value: i16 = new_value.try_into().with_context(|| {
                 format!("Failed to convert rescaled evaluation into i16: {new_value}.")
             })?;
@@ -1055,6 +1058,10 @@ fn rescale_binpacks(
             .context("Failed to serialise game into output buffer.")?;
 
         move_buffer = game.into_move_buffer();
+    }
+
+    if clamps > 0 {
+        println!("[!] clamped {clamps} rescaled evaluations into the heuristic range.");
     }
 
     output_buffer
@@ -1107,6 +1114,7 @@ fn relabel_binpacks(
     let start = Instant::now();
     let mut games = 0u64;
     let mut positions = 0u64;
+    let mut clamped = 0u64;
 
     let mut move_buffer = Vec::new();
     while let Ok(mut game) =
@@ -1131,7 +1139,14 @@ fn relabel_binpacks(
                 // this *is* needlessly slow. converting a whole master-quality
                 // dataset will take small double-digit hours because of this.
                 nnue_state.reïnit_from(&rollout, nnue_params);
-                let pov_eval = nnue_state.evaluate(nnue_params, &rollout);
+                // the raw output can be far outside the heuristic range (and
+                // even outside i16) in positions with insane material
+                // imbalances, so we clamp it.
+                let raw_eval = nnue_state.evaluate(nnue_params, &rollout);
+                let pov_eval = clamp_net_output(raw_eval);
+                if pov_eval != raw_eval {
+                    clamped += 1;
+                }
                 // viriformat uses white-relative evaluations throughout.
                 if rollout.turn() == Colour::Black {
                     -pov_eval
@@ -1140,10 +1155,6 @@ fn relabel_binpacks(
                 }
             };
 
-            // some little debug info if something goes wrong:
-            if is_decisive(new_value) && !is_decisive(value) {
-                eprintln!("[!] a network evaluation became decisive ({value} -> {new_value})");
-            }
             let new_value: i16 = new_value.try_into().with_context(|| {
                 format!("Failed to convert network evaluation into i16: {new_value}.")
             })?;
@@ -1192,6 +1203,9 @@ fn relabel_binpacks(
             "[!] stopped {}b short of the end of the input.",
             file_size - final_pos
         );
+    }
+    if clamped > 0 {
+        println!("[!] clamped {clamped} network evaluations into the heuristic range.");
     }
 
     output_buffer

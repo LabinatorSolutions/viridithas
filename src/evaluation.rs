@@ -112,15 +112,21 @@ impl Board {
     }
 }
 
+/// Clamp a raw network output.
+///
+/// This basically never comes up, but the network will
+/// occasionally output OOB values in crazy positions with
+/// massive material imbalances.
+pub fn clamp_net_output(v: i32) -> i32 {
+    v.clamp(-MINIMUM_TB_WIN_SCORE + 1024, MINIMUM_TB_WIN_SCORE - 1024)
+}
+
 pub fn evaluate_nnue(t: &ThreadData) -> i32 {
     // get the raw network output
     let v = t.nnue.evaluate(t.nnue_params, &t.board);
 
     // clamp the value into the valid range.
-    // this basically never comes up, but the network will
-    // occasionally output OOB values in crazy positions with
-    // massive material imbalances.
-    v.clamp(-MINIMUM_TB_WIN_SCORE + 1024, MINIMUM_TB_WIN_SCORE - 1024)
+    clamp_net_output(v)
 }
 
 pub fn evaluate(t: &mut ThreadData, nodes: u64) -> i32 {
